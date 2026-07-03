@@ -30,6 +30,9 @@
 #                           スイッチロール用スクリプトのパス。別チームが
 #                           用意した専用シェルを source で呼び出す。
 #                           環境変数 SWITCH_ROLE_SCRIPT でも指定可能。
+#   -f, --force             同名タグが既にリモートに存在する場合、既存タグを
+#                           削除してから付け替える。
+#                           (デフォルト: 同名タグがあれば中止する)
 #   -y, --yes               push 前の確認プロンプトをスキップする
 #   -n, --dry-run           実際には実行せず、実行内容のみ表示する
 #   -h, --help              このヘルプを表示する
@@ -39,6 +42,7 @@
 #   ./create_codecommit_tag.sh -r ap-northeast-1 my-repo main release
 #   ./create_codecommit_tag.sh -p myprofile --dry-run my-repo main release
 #   ./create_codecommit_tag.sh -A -s /opt/team/switch_role.sh my-repo main release
+#   ./create_codecommit_tag.sh -f my-repo main release   # 同名タグを付け替える
 #
 # 前提:
 #   - 事前に `aws login --remote` で認証済みであること。未認証の場合は
@@ -69,12 +73,13 @@ SEPARATOR="_"
 DATE_FORMAT="+%Y%m%d"
 DRY_RUN=false
 ASSUME_YES=false
+FORCE=false
 AUTO_SWITCH_ROLE=false
 # 環境変数 SWITCH_ROLE_SCRIPT があればデフォルト値として使う
 SWITCH_ROLE_SCRIPT="${SWITCH_ROLE_SCRIPT:-}"
 
 usage() {
-  sed -n '2,50p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,54p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # ---------------------------------------------------------------------------
@@ -103,6 +108,8 @@ while [[ $# -gt 0 ]]; do
     -s | --switch-role-script)
       [[ $# -ge 2 ]] || die "オプション $1 には値が必要です"
       SWITCH_ROLE_SCRIPT="$2"; shift 2 ;;
+    -f | --force)
+      FORCE=true; shift ;;
     -y | --yes)
       ASSUME_YES=true; shift ;;
     -n | --dry-run)
@@ -165,6 +172,7 @@ log_info "リージョン    : $REGION"
 log_info "対象ブランチ  : $BRANCH"
 log_info "作成タグ      : $FULL_TAG"
 log_info "リモート URL  : $REPO_URL"
+[[ "$FORCE" == "true" ]] && log_info "force モード   : 有効 (同名タグがあれば削除して付け替え)"
 [[ "$AUTO_SWITCH_ROLE" == "true" ]] && log_info "スイッチロール: 自動 (権限不足時に source して切替)"
 echo
 
@@ -254,6 +262,10 @@ run git clone --quiet --single-branch --branch "$BRANCH" --depth 1 "$REPO_URL" "
 # dry-run では clone していないため、以降のリポジトリ操作はスキップする
 if [[ "$DRY_RUN" == "true" ]]; then
   log_warn "[DRY-RUN] 以降の処理（重複チェック / タグ作成 / push）は表示のみ:"
+  if [[ "$FORCE" == "true" ]]; then
+    log_warn "(force モード: 同名タグがリモートに存在する場合は先に削除します)"
+    run git -C "$WORK_DIR/repo" push origin ":refs/tags/$FULL_TAG"
+  fi
   run git -C "$WORK_DIR/repo" tag -a "$FULL_TAG" -m "Created by $(basename "$0") for branch $BRANCH" HEAD
   run git -C "$WORK_DIR/repo" push origin "refs/tags/$FULL_TAG"
   echo
@@ -267,7 +279,29 @@ fi
 log_info "リモートに同名タグが無いか確認します: $FULL_TAG"
 if git -C "$WORK_DIR/repo" ls-remote --tags origin "refs/tags/$FULL_TAG" \
      | grep -q "refs/tags/${FULL_TAG}$"; then
-  die "タグ '$FULL_TAG' は既にリモートに存在します。処理を中止します"
+  if [[ "$FORCE" != "true" ]]; then
+    die "タグ '$FULL_TAG' は既にリモートに存在します。付け替える場合は --force を指定してください"
+  fi
+
+  # force モード: 既存タグを削除してから付け替える
+  log_warn "タグ '$FULL_TAG' は既にリモートに存在します（force モード: 付け替えます）"
+  if ! confirm "既存タグ '$FULL_TAG' を削除して付け替えますか?"; then
+    log_warn "付け替えをキャンセルしました（ローカルの一時 clone は破棄されます）"
+    exit 0
+  fi
+
+  log_info "リモートの既存タグを削除します: $FULL_TAG"
+  run git -C "$WORK_DIR/repo" push --quiet origin ":refs/tags/$FULL_TAG"
+  log_success "リモートの既存タグを削除しました: $FULL_TAG"
+
+  # shallow clone で取得済みのローカルタグが残っている場合に備えて削除する
+  if git -C "$WORK_DIR/repo" rev-parse -q --verify "refs/tags/$FULL_TAG" >/dev/null 2>&1; then
+    run git -C "$WORK_DIR/repo" tag -d "$FULL_TAG"
+  fi
+
+  # 既に削除確認まで済ませたので、以降の push 確認はスキップする
+  ASSUME_YES=true
+  export ASSUME_YES
 fi
 
 HEAD_COMMIT="$(git -C "$WORK_DIR/repo" rev-parse HEAD)"
